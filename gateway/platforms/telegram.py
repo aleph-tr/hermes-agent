@@ -527,6 +527,13 @@ class TelegramAdapter(BasePlatformAdapter):
             self._bot = self._app.bot
             
             # Register handlers
+            # Handle edited messages FIRST (edit-as-branch).
+            # Must be before other handlers because MessageFilter.check_update
+            # matches edited_message updates too.
+            self._app.add_handler(TelegramMessageHandler(
+                filters.UpdateType.EDITED_MESSAGE & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
+                self._handle_edited_message
+            ))
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
                 self._handle_text_message
@@ -976,6 +983,20 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return await super().send_voice(chat_id, audio_path, caption, reply_to)
     
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a message from a Telegram chat. Returns True on success."""
+        if not self._bot:
+            return False
+        try:
+            await self._bot.delete_message(
+                chat_id=int(chat_id),
+                message_id=int(message_id),
+            )
+            return True
+        except Exception as e:
+            logger.warning("[%s] Failed to delete message %s: %s", self.name, message_id, e)
+            return False
+
     async def send_image_file(
         self,
         chat_id: str,
@@ -2061,6 +2082,17 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name, cache_key, thread_id,
             )
 
+    async def _handle_edited_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle an edited text message -- triggers edit-as-branch."""
+        edited = update.edited_message
+        if not edited or not edited.text:
+            return
+
+        event = self._build_message_event(edited, MessageType.TEXT)
+        event.is_edit = True
+
+        await self.handle_message(event)
+
     def _build_message_event(self, message: Message, msg_type: MessageType) -> MessageEvent:
         """Build a MessageEvent from a Telegram message."""
         chat = message.chat
@@ -2109,7 +2141,11 @@ class TelegramAdapter(BasePlatformAdapter):
         reply_to_text = None
         if message.reply_to_message:
             reply_to_id = str(message.reply_to_message.message_id)
-            reply_to_text = message.reply_to_message.text or message.reply_to_message.caption or None
+            # Prefer the partial quote (selected text) when user quoted specific text
+            if getattr(message, "quote", None) and message.quote.text:
+                reply_to_text = message.quote.text
+            else:
+                reply_to_text = message.reply_to_message.text or message.reply_to_message.caption or None
 
         return MessageEvent(
             text=message.text or "",

@@ -345,6 +345,9 @@ class MessageEvent:
     
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
+
+    # Edit flag (set when this event is from an edited message)
+    is_edit: bool = False
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -431,6 +434,10 @@ class BasePlatformAdapter(ABC):
         self._background_tasks: set[asyncio.Task] = set()
         # Chats where auto-TTS on voice input is disabled (set by /voice off)
         self._auto_tts_disabled_chats: set = set()
+        # Maps user platform_message_id -> list of bot response platform_message_ids
+        # Used by edit-as-branch to delete old bot responses from chat
+        self._response_message_ids: Dict[str, List[str]] = {}
+        self._response_ids_callback: Optional[Callable] = None
 
     @property
     def has_fatal_error(self) -> bool:
@@ -514,7 +521,11 @@ class BasePlatformAdapter(ABC):
         an optional response string.
         """
         self._message_handler = handler
-    
+
+    def set_response_ids_callback(self, callback: Callable) -> None:
+        """Set callback for persisting bot response IDs after sending."""
+        self._response_ids_callback = callback
+
     @abstractmethod
     async def connect(self) -> bool:
         """
@@ -563,6 +574,12 @@ class BasePlatformAdapter(ABC):
         sending a new message.
         """
         return SendResult(success=False, error="Not supported")
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a previously sent message. Returns True on success.
+        Override in subclasses. Default returns False (not supported).
+        """
+        return False
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """
@@ -1109,6 +1126,7 @@ class BasePlatformAdapter(ABC):
             # Send response if any
             if not response:
                 logger.warning("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
+            _sent_message_ids = []  # Collect bot response IDs for edit-as-branch
             if response:
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)
@@ -1173,6 +1191,9 @@ class BasePlatformAdapter(ABC):
                         metadata=_thread_metadata,
                     )
                     _record_delivery(result)
+                    # Collect bot response message ID for edit-as-branch
+                    if getattr(result, "success", False) and getattr(result, "message_id", None):
+                        _sent_message_ids.append(result.message_id)
 
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()
@@ -1271,6 +1292,15 @@ class BasePlatformAdapter(ABC):
                             )
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+
+            # Store mapping of user message -> bot response IDs (for edit-as-branch)
+            if event.message_id and _sent_message_ids:
+                self._response_message_ids[event.message_id] = _sent_message_ids
+                if self._response_ids_callback:
+                    try:
+                        self._response_ids_callback(event, _sent_message_ids)
+                    except Exception as e:
+                        logger.warning("[%s] Failed to persist response IDs: %s", self.name, e)
 
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)

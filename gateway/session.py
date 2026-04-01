@@ -938,6 +938,7 @@ class SessionStore:
                     tool_name=message.get("tool_name"),
                     tool_calls=message.get("tool_calls"),
                     tool_call_id=message.get("tool_call_id"),
+                    platform_message_id=message.get("platform_message_id"),
                 )
             except Exception as e:
                 logger.debug("Session DB operation failed: %s", e)
@@ -969,6 +970,7 @@ class SessionStore:
                         reasoning=msg.get("reasoning") if role == "assistant" else None,
                         reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                         codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
+                        platform_message_id=msg.get("platform_message_id"),
                     )
             except Exception as e:
                 logger.debug("Failed to rewrite transcript in DB: %s", e)
@@ -978,6 +980,24 @@ class SessionStore:
         with open(transcript_path, "w", encoding="utf-8") as f:
             for msg in messages:
                 f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+
+
+    def backfill_platform_message_id(self, session_id: str, role: str, content: str, platform_message_id: str) -> bool:
+        """Backfill platform_message_id on a message the agent already persisted to SQLite."""
+        if self._db:
+            try:
+                return self._db.set_platform_message_id(session_id, role, content, platform_message_id)
+            except Exception as e:
+                logger.debug("Failed to backfill platform_message_id: %s", e)
+        return False
+
+    def tag_response_message_ids(self, session_id: str, platform_message_id: str, response_ids: list) -> None:
+        """Persist bot response message IDs on the user's transcript entry."""
+        import json
+        if self._db:
+            self._db.set_response_message_ids(
+                session_id, platform_message_id, json.dumps(response_ids)
+            )
 
     def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages from a session's transcript."""

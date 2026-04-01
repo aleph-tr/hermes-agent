@@ -32,7 +32,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -330,6 +330,16 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+
+            if current_version < 7:
+                # v7: add platform_message_id and response_message_ids to messages (for edit-as-branch)
+                for col_name in ['platform_message_id', 'response_message_ids']:
+                    try:
+                        cursor.execute(f'ALTER TABLE messages ADD COLUMN {col_name} TEXT')
+                    except sqlite3.OperationalError:
+                        pass  # Column already exists
+                cursor.execute('UPDATE schema_version SET version = 7')
+
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -868,6 +878,7 @@ class SessionDB:
         reasoning: str = None,
         reasoning_details: Any = None,
         codex_reasoning_items: Any = None,
+        platform_message_id: str = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -895,8 +906,9 @@ class SessionDB:
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, timestamp, token_count, finish_reason,
-                   reasoning, reasoning_details, codex_reasoning_items)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   reasoning, reasoning_details, codex_reasoning_items,
+                   platform_message_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -910,6 +922,7 @@ class SessionDB:
                     reasoning,
                     reasoning_details_json,
                     codex_items_json,
+                    platform_message_id,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -957,7 +970,8 @@ class SessionDB:
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT role, content, tool_call_id, tool_calls, tool_name, "
-                "reasoning, reasoning_details, codex_reasoning_items "
+                "reasoning, reasoning_details, codex_reasoning_items, "
+                "platform_message_id, response_message_ids "
                 "FROM messages WHERE session_id = ? ORDER BY timestamp, id",
                 (session_id,),
             )
@@ -990,6 +1004,10 @@ class SessionDB:
                         msg["codex_reasoning_items"] = json.loads(row["codex_reasoning_items"])
                     except (json.JSONDecodeError, TypeError):
                         pass
+            if row["platform_message_id"]:
+                msg["platform_message_id"] = row["platform_message_id"]
+            if row["response_message_ids"]:
+                msg["response_message_ids"] = row["response_message_ids"]
             messages.append(msg)
         return messages
 
@@ -1219,6 +1237,42 @@ class SessionDB:
             messages = self.get_messages(session["id"])
             results.append({**session, "messages": messages})
         return results
+
+
+    def set_platform_message_id(self, session_id: str, role: str, content: str, platform_message_id: str) -> bool:
+        """Backfill platform_message_id on an existing message (matched by session, role, content).
+
+        Used when the agent persists messages to SQLite before platform metadata
+        is available, and the gateway needs to tag them after the fact.
+        Updates the LAST matching message (most recent) to avoid tagging old duplicates.
+        """
+        with self._lock:
+            cursor = self._conn.execute(
+                """SELECT id FROM messages
+                   WHERE session_id = ? AND role = ? AND content = ? AND platform_message_id IS NULL
+                   ORDER BY timestamp DESC, id DESC LIMIT 1""",
+                (session_id, role, content),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return False
+            self._conn.execute(
+                "UPDATE messages SET platform_message_id = ? WHERE id = ?",
+                (platform_message_id, row[0] if isinstance(row, tuple) else row["id"]),
+            )
+            self._conn.commit()
+        return True
+
+    def set_response_message_ids(self, session_id: str, platform_message_id: str, response_ids_json: str) -> None:
+        """Tag a user message with its bot response message IDs (JSON list)."""
+        with self._lock:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """UPDATE messages SET response_message_ids = ?
+                   WHERE session_id = ? AND platform_message_id = ?""",
+                (response_ids_json, session_id, platform_message_id),
+            )
+            self._conn.commit()
 
     def clear_messages(self, session_id: str) -> None:
         """Delete all messages for a session and reset its counters."""
